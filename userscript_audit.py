@@ -626,7 +626,7 @@ def _get(url, tries=4):
 def fetch_greasyfork(sid):
     sid = re.sub(r"\D.*$", "", str(sid).rsplit("/scripts/", 1)[-1])
     info = json.loads(_get("https://api.greasyfork.org/en/scripts/%s.json" % sid))
-    return "greasyfork:%s (%s)" % (sid, info.get("name", "")), _get(info["code_url"])
+    return "greasyfork:%s" % sid, _get(info["code_url"])
 
 
 def fetch_openuserjs(ref):
