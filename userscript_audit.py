@@ -162,6 +162,24 @@ PATTERNS = {
 
 _COMPILED = [(sev, pg, re.compile(rx, re.I)) for sev, groups in PATTERNS.items() for pg in groups
              for rx in pg["regexes"]]
+# Anchor strings (lower-case): a signature only runs when one of them occurs in the script.
+# None = always run.
+NEEDLES = {
+    "miner": ("coinhive", "coin-hive", "cryptonight", "coinimp", "webminepool", "minero", "jsecoin", "crypto-loot",
+              "cryptoloot", "authedmine", "webmine", "monerominer", "stratum+", ".anonymous", ".user"),
+    "packed_eval": ("eval", "function"),
+    "affiliate_rewrite": ("tag=", "taobao", "jd.com", "aff_", "linksynergy", "affid", "amzn.to", "skimresources",
+                          "viglink", "associate", "yiqifa", "yangkeduo"),
+    "exe_download": ("gm_download",),
+    "remote_script_src": (".src",),
+    "analytics": ("google-analytics", "googletagmanager", "hm.baidu", "cnzz", "51.la", "umami", "plausible",
+                  "clarity.ms", "cloudflareinsights"),
+    "key_listener": ("onkey", "keydown", "keyup", "keypress"),
+    "cookie_read": ("cookie",),
+    "dynamic_code": ("eval", "function"),
+    "clipboard_write": ("clipboard", "copy"),
+    "crypto_address": None,
+}
 OBF_IDENT = re.compile(r"(?<![\"'`\w$])_0x[0-9a-f]{4,6}\b(?![\"'`])")   # identifiers, not quoted names
 JSON_EVAL = re.compile(r"eval\s{0,4}\(\s{0,4}[\"']\(\s{0,2}[\"']\s{0,4}\+\s{0,4}[\w.$\[\]]{1,60}\s{0,4}\+\s{0,4}[\"']\s{0,2}\)[\"']\s{0,4}\)")
 STRING_ARRAY = re.compile(r"\b(?:var|const|let)\s{1,4}_0x[0-9a-f]{4,6}\s{0,4}=\s{0,4}\[\s{0,4}[\"']")
@@ -335,6 +353,9 @@ def scan(content, label="<text>", listing=None):
 
     seen = set()
     for sev, pg, rx in _COMPILED:
+        nd = NEEDLES.get(pg["id"])
+        if nd and not any(n in low for n in nd):
+            continue
         hits = 0
         for m in rx.finditer(text):
             if hits >= 10:
@@ -352,7 +373,13 @@ def scan(content, label="<text>", listing=None):
                 if re.match(r"\s{0,2}[\"']{1,2}\s{0,2}\+", after) or (before[-1:] in "\"'" and re.match(r"[\"']\s{0,2}\+", after)):
                     s = "INFO"      # building an eval(atob('...')) string from its own visible code
                 elif re.match(r"\s{0,4}[\"'`]", after):
-                    pass            # literal payload: HIGH
+                    lit = re.match(r"\s{0,4}[\"'`]([A-Za-z0-9+/=]{0,40000})[\"'`]", after)
+                    if lit and len(lit.group(1)) < 40:
+                        # e.g. eval(atob("UElYSQ==")) -> "PIXI": a hidden identifier, not a payload
+                        s = "MEDIUM"
+                        pg = dict(pg, id="decode_eval", name="Decode-then-eval of a Short Literal",
+                                  desc="A short encoded literal is decoded and evaluated (hides an identifier, "
+                                       "not a payload)")
                 else:
                     arg = re.match(r"\s{0,4}([A-Za-z_$][\w$]{0,40})\s{0,4}\)", after)
                     lit = arg and re.search(r"\b" + re.escape(arg.group(1)) + r"\s{0,4}\+?=\s{0,4}[\"'][A-Za-z0-9+/=]{40,}",

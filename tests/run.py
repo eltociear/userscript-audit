@@ -28,6 +28,7 @@ EXPECT = {
     "med-verified-loader": ("MEDIUM", "remote_code_verified"),
     "mal-polyfill": ("HIGH", "require_compromised"),
     "med-suspect-cdn": ("MEDIUM", "require_suspect_cdn"),
+    "med-short-decode-eval": ("MEDIUM", "decode_eval"),
     "med-affiliate": ("MEDIUM", "affiliate_rewrite"),
     "med-require-http": ("MEDIUM", "require_http"),
     "med-url-leak": ("MEDIUM", "url_leak"),
@@ -60,9 +61,9 @@ print("%s comments ignored" % ("PASS" if ok else "FAIL")); fails += not ok
 
 # performance: a 5 MB single-line bundle plus a 1 MB base64 blob scans fast
 big = "var a=" + "\"" + "QUJD" * 250000 + "\";" + ("function f(x){return x+1};" * 180000)
-t0 = time.time(); ua.scan(big, "big"); dt = time.time() - t0
-ok = dt < 8
-print("%s 5 MB single-line bundle in %.1fs" % ("PASS" if ok else "FAIL", dt)); fails += not ok
+t0, w0 = time.process_time(), time.time(); ua.scan(big, "big"); dt, wt = time.process_time() - t0, time.time() - w0
+ok = dt < 8          # CPU time, so a busy machine does not fail the test
+print("%s 5 MB single-line bundle in %.1fs CPU (%.1fs wall)" % ("PASS" if ok else "FAIL", dt, wt)); fails += not ok
 
 # no canary credential is in a real provider's token format
 REAL = re.compile(r"[0-9]{8,10}:AA[A-Za-z0-9_-]{30,}|gh[pousr]_[A-Za-z0-9]{30,}|AKIA[0-9A-Z]{16}|"
