@@ -30,6 +30,7 @@ def _bytes(p):
 
 
 # ---- per-repo configuration -------------------------------------------------
+ERROR_EXIT = (0, 2)   # exit codes allowed when a target cannot be parsed (scanner-specific)
 MOD, TOOL = "userscript_audit", "userscript-audit"
 MAL = [os.path.join(HERE, "fixtures", "mal-cookie-webhook.user.js")]   # CRITICAL cookie_exfil
 BENIGN = [os.path.join(HERE, "fixtures", "ok-hotkeys.user.js")]
@@ -129,6 +130,9 @@ def no_escape(tc, doc, tmp):
             p = f["file"].replace("\\", "/")
             tc.assertFalse(p.startswith("/") or re.match(r"^[A-Za-z]:", p) or ".." in p.split("/"), p)
             tc.assertNotIn("OUTSIDE-CANARY", f["context"] + f["matched"], f)
+            ctx = f["context"].strip()
+            if len(ctx) > 12 and f["severity"] != "INFO":   # code that only exists outside the tree / archive root
+                tc.assertNotIn(ctx, OUTSIDE_PAYLOAD, f)
 
 
 class Family(unittest.TestCase):
@@ -330,7 +334,7 @@ class HostileArchives(unittest.TestCase):
                 p = os.path.join(self.tmp, "bad" + ext)
                 _write(p, blob)
                 rc, out, err = run([p, "--json"], timeout=60)
-                self.assertIn(rc, (0, 2), err[-500:])
+                self.assertIn(rc, ERROR_EXIT, err[-500:])
                 check_family_json(self, json.loads(out))
 
     def test_decompression_bomb_is_bounded(self):
