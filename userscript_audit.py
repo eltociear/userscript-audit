@@ -23,19 +23,22 @@ Usage:
   python userscript_audit.py --openuserjs <user>/<script>  # OpenUserJS
   python userscript_audit.py --url https://.../x.user.js   # any URL
   python userscript_audit.py --text "<code>"               # a string
-  options: --json  --verbose (show INFO)  --all (keep going, no early summary)
-Exit code 2 if any target is HIGH or CRITICAL (CI-friendly). MIT licensed.
+  options: --json (family schema)  --sarif (SARIF 2.1.0)  --fail-on {critical,high,medium,low,never}
+           --verbose (show INFO)  --all (keep going, no early summary)  --version
+Exit code 2 if any target reaches --fail-on (default HIGH; CI-friendly), 1 on usage errors. MIT licensed.
 """
 import bisect
+import hashlib
 import json
 import os
 import re
+import stat
 import sys
 import time
 import urllib.parse
 import urllib.request
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 MAX_FILE = 20_000_000
 BLOB_RE = re.compile(r"(?<![A-Za-z0-9+/=])[A-Za-z0-9+/=]{4096,}")
 NEAR = 600          # chars: "same statement neighbourhood" for source/sink combinations
@@ -651,18 +654,243 @@ def _print(r, verbose):
         print("    capabilities: %s" % ", ".join(r["capabilities"]))
 
 
+MAX_READ = 20000000   # bytes read per script
+
+
+def _read_text(p):
+    with open(p, "rb") as fh:
+        return fh.read(MAX_READ).decode("utf-8", "replace")
+
+
 def _iter_paths(paths):
+    """Yields (label, text) or (label, OSError). Directory walks open only regular files."""
     for p in paths:
         if p == "-":
-            yield "<stdin>", sys.stdin.read()
+            yield "<stdin>", sys.stdin.read(MAX_READ)
         elif os.path.isdir(p):
-            for root, _, files in os.walk(p):
+            for root, dirs, files in os.walk(p):
+                dirs[:] = sorted(d for d in dirs if d not in (".git", "node_modules"))
                 for f in sorted(files):
-                    if f.endswith((".user.js", ".js")):
-                        fp = os.path.join(root, f)
-                        yield fp, open(fp, encoding="utf-8", errors="replace").read()
+                    fp = os.path.join(root, f)
+                    if f.endswith((".user.js", ".js")) and regular_file(fp):
+                        yield fp, _read_text(fp)
+        elif os.path.isfile(p):
+            yield p, _read_text(p)
         else:
-            yield p, open(p, encoding="utf-8", errors="replace").read()
+            yield p, OSError("not a regular file or directory: %s" % p)
+
+
+# ---------------------------------------------------------------------------
+# Pipeline output shared by the eltociear/*-audit family: --json / --sarif / --fail-on
+# (this block is kept identical across the family; see "Output formats" in the README)
+# ---------------------------------------------------------------------------
+FAMILY_SCHEMA = "eltociear-audit/1"
+TOOL_NAME = "userscript-audit"
+TOOL_URI = "https://github.com/eltociear/userscript-audit"
+FAIL_ON_CHOICES = ("critical", "high", "medium", "low", "never")
+_FAM_RANK = {"SAFE": 0, "INFO": 0, "LOW": 1, "MEDIUM": 2, "HIGH": 3, "CRITICAL": 4}
+_FAM_SARIF_LEVEL = {"CRITICAL": "error", "HIGH": "error", "MEDIUM": "warning", "LOW": "note", "INFO": "note"}
+_FAM_SEC_SEV = {"CRITICAL": "9.5", "HIGH": "8.0", "MEDIUM": "5.5", "LOW": "3.0", "INFO": "0.0"}
+
+
+def family_args(args):
+    """Strip the shared output flags from argv. Returns (remaining_args, opts)."""
+    opts = {"json": False, "sarif": False, "fail_on": "high"}
+    rest, i = [], 0
+    while i < len(args):
+        a = args[i]
+        if a == "--json":
+            opts["json"] = True
+        elif a == "--sarif":
+            opts["sarif"] = True
+        elif a == "--fail-on" or a.startswith("--fail-on="):
+            if "=" in a:
+                v = a.split("=", 1)[1]
+            else:
+                v = args[i + 1] if i + 1 < len(args) else ""
+                i += 1
+            if v.lower() not in FAIL_ON_CHOICES:
+                sys.stderr.write("%s: --fail-on must be one of %s\n" % (TOOL_NAME, ", ".join(FAIL_ON_CHOICES)))
+                raise SystemExit(1)
+            opts["fail_on"] = v.lower()
+        else:
+            rest.append(a)
+        i += 1
+    return rest, opts
+
+
+def _fam_sev(s):
+    s = str(s or "").upper()
+    return s if s in _FAM_RANK else "INFO"
+
+
+def _fam_line(v):
+    try:
+        n = int(v)
+    except (TypeError, ValueError):
+        m = re.search(r"(\d+)\s*$", str(v or ""))
+        n = int(m.group(1)) if m else 0
+    return n if n > 0 else 0
+
+
+def family_finding(f, target):
+    out = dict(f) if isinstance(f, dict) else {"name": str(f)}
+    rid = str(out.get("id") or out.get("rule_id") or out.get("pattern") or "finding")
+    out.update({"rule_id": rid, "severity": _fam_sev(out.get("severity")),
+                "name": str(out.get("name") or rid), "description": str(out.get("description") or ""),
+                "file": str(out.get("file") or out.get("path") or ""), "line": _fam_line(out.get("line")),
+                "matched": str(out.get("matched") or ""), "context": str(out.get("context") or "")})
+    return out
+
+
+def family_result(r):
+    out = dict(r)
+    target = str(out.get("target") or "")
+    findings = [family_finding(f, target) for f in (out.get("findings") or [])]
+    info = [family_finding(f, target) for f in (out.get("info") or [])]
+    worst = max([_FAM_RANK[f["severity"]] for f in findings] + [_FAM_RANK.get(str(out.get("risk_level") or "").upper(), 0)])
+    level = next(k for k in ("CRITICAL", "HIGH", "MEDIUM", "LOW", "SAFE") if _FAM_RANK[k] == worst)
+    counts = {k: sum(1 for f in findings if f["severity"] == k) for k in ("CRITICAL", "HIGH", "MEDIUM", "LOW")}
+    out.update({"target": target, "risk_level": level, "risk_score": int(out.get("risk_score") or 0),
+                "error": out.get("error") or None, "counts": counts, "findings": findings, "info": info})
+    return out
+
+
+def family_exit(results, fail_on="high"):
+    """0 = below the threshold, 2 = a target reached it. Default threshold HIGH (the historic behaviour)."""
+    if fail_on == "never":
+        return 0
+    worst = max([_FAM_RANK[family_result(r)["risk_level"]] for r in results] or [0])
+    return 2 if worst >= _FAM_RANK[fail_on.upper()] else 0
+
+
+def family_json(results, fail_on="high"):
+    res = [family_result(r) for r in results]
+    worst = max([_FAM_RANK[r["risk_level"]] for r in res] or [0])
+    return {"schema": FAMILY_SCHEMA, "tool": {"name": TOOL_NAME, "version": __version__},
+            "fail_on": fail_on, "exit_code": family_exit(results, fail_on),
+            "max_severity": next(k for k in ("CRITICAL", "HIGH", "MEDIUM", "LOW", "SAFE") if _FAM_RANK[k] == worst),
+            "errors": sum(1 for r in res if r["error"]), "results": res}
+
+
+def _fam_uri(target, file):
+    """Repo-relative URI when the target is a local path, else the in-package path."""
+    file = (file or "").replace("\\", "/")
+    t = target or ""
+    if t and os.path.isdir(t):
+        p = os.path.normpath(os.path.join(t, file)) if file else os.path.normpath(t)
+        parts = file.split("/")
+        for k in range(1, len(parts)):   # scanner-side prefixes (e.g. custom_components/<d>/) not on disk
+            if not os.path.exists(p) and os.path.exists(os.path.join(t, *parts[k:])):
+                p = os.path.normpath(os.path.join(t, *parts[k:]))
+    elif t and os.path.isfile(t) and (not file or file == t or file == os.path.basename(t)):
+        p = os.path.normpath(t)
+    elif t and os.path.isfile(t):
+        p = os.path.normpath(t).replace("\\", "/") + "/" + file  # member of a local archive
+    else:
+        p = file or t or "unknown"
+    p = p.replace("\\", "/")
+    if os.path.isabs(p):
+        try:
+            rel = os.path.relpath(p)
+        except ValueError:
+            rel = None
+        if rel is not None and not rel.startswith(".."):
+            p = rel.replace("\\", "/")
+        else:
+            return "file://" + urllib.parse.quote(p, safe="/:")
+    parts = [s for s in p.split("/") if s not in ("", ".", "..")]
+    return urllib.parse.quote("/".join(parts) or "unknown", safe="/@+,;=-._~")
+
+
+def family_sarif(results):
+    rules, index, out, notes = [], {}, [], []
+    for r in (family_result(x) for x in results):
+        if r["error"]:
+            notes.append({"level": "error", "message": {"text": "%s: %s" % (r["target"], r["error"])}})
+        for f in r["findings"]:
+            sev, rid = f["severity"], f["rule_id"]
+            if rid not in index:
+                index[rid] = len(rules)
+                rules.append({"id": rid, "name": "".join(w.capitalize() for w in re.split(r"[^A-Za-z0-9]+", rid) if w) or "Finding",
+                              "shortDescription": {"text": f["name"]},
+                              "fullDescription": {"text": f["description"] or f["name"]},
+                              "helpUri": TOOL_URI + "#readme",
+                              "defaultConfiguration": {"level": _FAM_SARIF_LEVEL[sev]},
+                              "properties": {"tags": ["security", TOOL_NAME], "security-severity": _FAM_SEC_SEV[sev]}})
+            else:
+                rule = rules[index[rid]]
+                if float(_FAM_SEC_SEV[sev]) > float(rule["properties"]["security-severity"]):
+                    rule["properties"]["security-severity"] = _FAM_SEC_SEV[sev]
+                    rule["defaultConfiguration"]["level"] = _FAM_SARIF_LEVEL[sev]
+            phys = {"artifactLocation": {"uri": _fam_uri(r["target"], f["file"])}}
+            if f["line"]:
+                phys["region"] = {"startLine": f["line"]}
+                if f["context"]:
+                    phys["region"]["snippet"] = {"text": f["context"]}
+            msg = "%s: %s%s" % (sev, f["description"] or f["name"], (" [%s]" % f["matched"]) if f["matched"] else "")
+            fp = "%s|%s|%s|%s" % (r["target"], rid, f["file"], f["matched"] or f["line"])
+            out.append({"ruleId": rid, "ruleIndex": index[rid], "level": _FAM_SARIF_LEVEL[sev],
+                        "message": {"text": msg}, "locations": [{"physicalLocation": phys}],
+                        "partialFingerprints": {"auditFinding/v1": hashlib.sha256(fp.encode("utf-8", "replace")).hexdigest()[:32]},
+                        "properties": {"severity": sev, "target": r["target"]}})
+    return {"$schema": "https://json.schemastore.org/sarif-2.1.0.json", "version": "2.1.0",
+            "runs": [{"tool": {"driver": {"name": TOOL_NAME, "version": __version__, "semanticVersion": __version__,
+                                          "informationUri": TOOL_URI, "rules": rules}},
+                      "invocations": [{"executionSuccessful": not notes, "toolExecutionNotifications": notes}],
+                      "results": out}]}
+
+
+def family_emit(results, opts):
+    """Print --json / --sarif output (if requested) and return the process exit code."""
+    if opts.get("sarif"):
+        print(json.dumps(family_sarif(results), indent=1, ensure_ascii=False))
+    elif opts.get("json"):
+        print(json.dumps(family_json(results, opts["fail_on"]), indent=1, ensure_ascii=False))
+    return family_exit(results, opts["fail_on"])
+
+
+# ---------------------------------------------------------------------------
+# Untrusted-input hygiene shared by the family (nothing is ever extracted to disk)
+# ---------------------------------------------------------------------------
+MAX_MEMBERS = 50000             # archive entries considered per target
+MAX_ARCHIVE_TOTAL = 300000000   # decompressed bytes read per archive (zip/tar bomb budget)
+
+
+def safe_member(name):
+    """Normalise an archive member name; None for traversal (../), absolute, drive or NUL paths."""
+    n = (name or "").replace("\\", "/")
+    if "\x00" in n or n.startswith("/") or re.match(r"^[A-Za-z]:", n):
+        return None
+    parts = [p for p in n.split("/") if p not in ("", ".")]
+    if not parts or ".." in parts:
+        return None
+    return "/".join(parts)
+
+
+def regular_file(path):
+    """True only for a real regular file (no symlinks, FIFOs, devices or sockets)."""
+    try:
+        return stat.S_ISREG(os.lstat(path).st_mode)
+    except OSError:
+        return False
+
+
+class ArchiveBudget:
+    """Caps entries and total decompressed bytes read from one archive."""
+
+    def __init__(self, total=None, members=None):
+        self.left = MAX_ARCHIVE_TOTAL if total is None else total
+        self.members = MAX_MEMBERS if members is None else members
+        self.truncated = False
+
+    def take(self, size):
+        self.members -= 1
+        if self.members < 0 or size > self.left:
+            self.truncated = True
+            return False
+        self.left -= size
+        return True
 
 
 def main(argv=None):
@@ -670,7 +898,11 @@ def main(argv=None):
     if not args or args[0] in ("-h", "--help"):
         print(__doc__)
         return 0
-    as_json = "--json" in args
+    if args[0] == "--version":
+        print(TOOL_NAME, __version__)
+        return 0
+    args, fam = family_args(args)
+    as_json = fam["json"] or fam["sarif"]
     verbose = "--verbose" in args or "-v" in args
     args = [a for a in args if a not in ("--json", "--verbose", "-v", "--all")]
     targets = []
@@ -686,10 +918,15 @@ def main(argv=None):
         targets = [lambda lt=lt: lt for lt in _iter_paths(args)]
     results, worst = [], "SAFE"
     for t in targets:
+        label = None
         try:
             label, text = t()
+            if isinstance(text, Exception):
+                raise text
         except Exception as e:
             print("error: %s" % e, file=sys.stderr)
+            results.append({"target": label or "<fetch>", "risk_level": "SAFE", "risk_score": 0,
+                            "findings": [], "info": [], "error": str(e)[:200]})
             continue
         r = scan(text, label)
         results.append(r)
@@ -697,9 +934,7 @@ def main(argv=None):
             worst = r["risk_level"]
         if not as_json:
             _print(r, verbose)
-    if as_json:
-        print(json.dumps(results, indent=1, ensure_ascii=False))
-    return 2 if SEV_ORDER[worst] >= SEV_ORDER["HIGH"] else 0
+    return family_emit(results, fam)
 
 
 if __name__ == "__main__":
